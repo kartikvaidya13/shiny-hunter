@@ -1,0 +1,13 @@
+# --- AI / assistant documentation (local-only, not versioned) ---
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+GEMINI.md
+.cursorrules
+.cursor/
+.aider*
+.claude/
+.github/copilot-instructions.md
+
+# --- Working docs (local-only scratch space) ---
+docs/
