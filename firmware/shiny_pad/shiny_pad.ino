@@ -6,17 +6,24 @@
 #include <string.h>
 
 #include "timed_pad.h"
+#include "wifi_link.h"
 
-const char kFirmwareVersion[] = "0.1.0";
-const unsigned kProtocolVersion = 1;
+const char kFirmwareVersion[] = "0.2.0";
+const unsigned kProtocolVersion = 2;
 const uint32_t kBaud = 115200;
 const size_t kMaxEvents = 64;
-const uint32_t kMinSpacingUs = 2000;     // provisional until F3 measures the floor
-const uint32_t kRefreshGuardUs = 10000;  // > worst-case 8 ms poll, so a keep-alive never delays an event
-const size_t kLineMax = 96;
+// F3, 2026-10-24, Switch 2: it accepts one report per ~8 ms; faster streams back up and drift.
+const uint32_t kMinSpacingUs = 10000;
+// Slower than 8 ms so idle keep-alives never back up the console's queue.
+const uint32_t kKeepAliveMs = 100;
+// Keep-alives, network I/O and DONE output only run when the next event is further off than this.
+const uint32_t kSlackGuardUs = 20000;
+// TCP reads skip this window before an event: each poll costs tens of µs of event latency.
+const uint32_t kReadGuardUs = 2000;
+const size_t kLineMax = 128;
 const size_t kMaxTokens = 10;
 const uint8_t kStickCentre = 0x80;
-const uint16_t kButtonMask = 0x3FFF;     // 14 buttons in the descriptor
+const uint16_t kButtonMask = 0x3FFF;  // 14 buttons in the descriptor
 const uint8_t kDpadCentred = 15;
 
 struct Event {
@@ -25,12 +32,26 @@ struct Event {
   uint8_t dpad, lx, ly, rx, ry;
 };
 
+struct Result {
+  uint32_t before_us, send_us;
+  int32_t err_us;
+  bool ok;
+};
+
+struct LineReader {
+  char buf[kLineMax + 1];
+  size_t len;
+  bool overflow;
+};
+
 enum class State : uint8_t { Idle, Loading, Armed, Running };
 
 static TimedPad pad;
 static Event events[kMaxEvents];
+static Result results[kMaxEvents];
 static size_t eventCount = 0;
 static size_t nextEvent = 0;
+static size_t resultsReported = 0;
 static State state = State::Idle;
 
 static uint32_t armedAtMs = 0;
@@ -38,10 +59,13 @@ static uint32_t armTimeoutMs = 0;
 static uint32_t anchorUs = 0;
 static uint32_t maxAbsErrUs = 0;
 static size_t failedSends = 0;
+static bool anchorPending = false;
+static uint32_t lastKeepAliveMs = 0;
 
-static char line[kLineMax + 1];
-static size_t lineLen = 0;
-static bool lineOverflow = false;
+static Stream *cmdLink = &Serial;  // where the current command's reply goes
+static Stream *runLink = &Serial;  // the link that armed the timeline; gets DONE/END
+static LineReader serialReader;
+static LineReader tcpReader;
 
 const char *stateName() {
   switch (state) {
@@ -58,11 +82,11 @@ size_t freeSlots() {
 }
 
 void replyErr(const char *code, const char *detail) {
-  Serial.printf("ERR %s %s\n", code, detail);
+  cmdLink->printf("ERR %s %s\n", code, detail);
 }
 
 void replyErrSeq(const char *code, uint32_t seq) {
-  Serial.printf("ERR %s %lu\n", code, (unsigned long)seq);
+  cmdLink->printf("ERR %s %lu\n", code, (unsigned long)seq);
 }
 
 // Strict unsigned parse: whole token, no sign, no overflow, <= max.
@@ -76,20 +100,46 @@ bool parseU32(const char *s, int base, uint32_t max, uint32_t *out) {
   return true;
 }
 
+// True when nothing is due within guardUs, so a slow call can't delay an event.
+bool hasSlack(uint32_t guardUs = kSlackGuardUs) {
+  if (state != State::Running) return true;
+  uint32_t elapsed = micros() - anchorUs;
+  uint32_t due = events[nextEvent].at_us;
+  return due > elapsed && due - elapsed > guardUs;
+}
+
+// ANCHOR and DONE lines are held until there's slack: a TCP write can block for a millisecond.
+void reportResults(bool all) {
+  if (anchorPending && (all || hasSlack())) {
+    runLink->printf("ANCHOR %lu\n", (unsigned long)anchorUs);
+    anchorPending = false;
+  }
+  while (resultsReported < nextEvent && (all || hasSlack())) {
+    const Event &ev = events[resultsReported];
+    const Result &r = results[resultsReported];
+    runLink->printf("DONE %u %lu %ld %lu\n", (unsigned)ev.seq, (unsigned long)r.before_us,
+                    (long)r.err_us, (unsigned long)r.send_us);
+    if (!r.ok) runLink->printf("ERR SEND %u\n", (unsigned)ev.seq);
+    resultsReported++;
+  }
+}
+
 void resetTimeline() {
   eventCount = 0;
   nextEvent = 0;
+  resultsReported = 0;
   state = State::Idle;
 }
 
 void abortTimeline() {
+  if (state == State::Running) reportResults(true);
   resetTimeline();
   pad.sendNeutral();
-  Serial.print("ABORTED\n");
+  cmdLink->print("ABORTED\n");
 }
 
 void cmdPing() {
-  Serial.printf("PONG %s %u %u\n", kFirmwareVersion, kProtocolVersion, (unsigned)freeSlots());
+  cmdLink->printf("PONG %s %u %u\n", kFirmwareVersion, kProtocolVersion, (unsigned)freeSlots());
 }
 
 void cmdEv(char **tok, size_t n) {
@@ -131,7 +181,7 @@ void cmdEv(char **tok, size_t n) {
                           (uint8_t)sticks[0], (uint8_t)sticks[1],
                           (uint8_t)sticks[2], (uint8_t)sticks[3]};
   state = State::Loading;
-  Serial.printf("OK %lu %u\n", (unsigned long)seq, (unsigned)freeSlots());
+  cmdLink->printf("OK %lu %u\n", (unsigned long)seq, (unsigned)freeSlots());
 }
 
 void cmdArm(char **tok, size_t n) {
@@ -145,18 +195,30 @@ void cmdArm(char **tok, size_t n) {
   }
   armedAtMs = millis();
   armTimeoutMs = timeout;
+  runLink = cmdLink;
   state = State::Armed;
-  Serial.printf("ARMED %u\n", (unsigned)eventCount);
+  cmdLink->printf("ARMED %u\n", (unsigned)eventCount);
 }
 
 void cmdFire() {
   if (state != State::Armed) { replyErr("NOT_ARMED", stateName()); return; }
   anchorUs = micros();
   nextEvent = 0;
+  resultsReported = 0;
   maxAbsErrUs = 0;
   failedSends = 0;
+  anchorPending = true;
   state = State::Running;
-  Serial.printf("ANCHOR %lu\n", (unsigned long)anchorUs);
+}
+
+// Serial only: credentials must never travel over the network they unlock.
+void cmdWifi(char **tok, size_t n) {
+  if (cmdLink != &Serial) { replyErr("NOT_ALLOWED", "tcp"); return; }
+  if (state == State::Armed || state == State::Running) { replyErr("BUSY", stateName()); return; }
+  if (n == 1) { wifiPrintStatus(Serial); return; }
+  if (n > 3) { replyErr("BAD_ARGS", "WIFI"); return; }
+  wifiSave(tok[1], n == 3 ? tok[2] : "");
+  Serial.print("WIFI SAVED -\n");
 }
 
 void handleLine(char *s) {
@@ -173,6 +235,7 @@ void handleLine(char *s) {
   bool bare = (n == 1);
   if (strcasecmp(cmd, "EV") == 0) cmdEv(tok, n);
   else if (strcasecmp(cmd, "ARM") == 0) cmdArm(tok, n);
+  else if (strcasecmp(cmd, "WIFI") == 0) cmdWifi(tok, n);
   else if (strcasecmp(cmd, "PING") == 0) bare ? cmdPing() : replyErr("BAD_ARGS", "PING");
   else if (strcasecmp(cmd, "FIRE") == 0) bare ? cmdFire() : replyErr("BAD_ARGS", "FIRE");
   else if (strcasecmp(cmd, "ABORT") == 0) bare ? abortTimeline() : replyErr("BAD_ARGS", "ABORT");
@@ -180,23 +243,24 @@ void handleLine(char *s) {
 }
 
 // Handles at most one complete line per call so a burst of input can't starve the scheduler.
-void pollSerial() {
-  while (Serial.available() > 0) {
-    int c = Serial.read();
+void pollLink(Stream &link, LineReader &r) {
+  while (link.available() > 0) {
+    int c = link.read();
     if (c == '\r') continue;
     if (c != '\n') {
-      if (lineLen < kLineMax) line[lineLen++] = (char)c;
-      else lineOverflow = true;
+      if (r.len < kLineMax) r.buf[r.len++] = (char)c;
+      else r.overflow = true;
       continue;
     }
-    if (lineOverflow) {
+    cmdLink = &link;
+    if (r.overflow) {
       replyErr("LINE_TOO_LONG", "-");
     } else {
-      line[lineLen] = '\0';
-      handleLine(line);
+      r.buf[r.len] = '\0';
+      handleLine(r.buf);
     }
-    lineLen = 0;
-    lineOverflow = false;
+    r.len = 0;
+    r.overflow = false;
     return;
   }
 }
@@ -210,48 +274,57 @@ void runDueEvents() {
     int32_t err = (int32_t)(st.before_us - (anchorUs + ev.at_us));
     uint32_t absErr = err < 0 ? 0u - (uint32_t)err : (uint32_t)err;
     if (absErr > maxAbsErrUs) maxAbsErrUs = absErr;
-
-    Serial.printf("DONE %u %lu %ld %lu\n", (unsigned)ev.seq, (unsigned long)st.before_us,
-                  (long)err, (unsigned long)(st.after_us - st.before_us));
-    if (!st.ok) {
-      failedSends++;
-      replyErrSeq("SEND", ev.seq);
-    }
+    if (!st.ok) failedSends++;
+    results[nextEvent] = {st.before_us, st.after_us - st.before_us, err, st.ok};
     nextEvent++;
   }
 
   // Anything still held is released here; a timeline should normally end on a release.
   pad.sendNeutral();
-  Serial.printf("END %u %lu %u\n", (unsigned)eventCount, (unsigned long)maxAbsErrUs,
-                (unsigned)failedSends);
+  reportResults(true);
+  runLink->printf("END %u %lu %u\n", (unsigned)eventCount, (unsigned long)maxAbsErrUs,
+                  (unsigned)failedSends);
   resetTimeline();
 }
 
-bool refreshAllowed() {
-  if (state != State::Running) return true;
-  uint32_t elapsed = micros() - anchorUs;
-  uint32_t due = events[nextEvent].at_us;
-  return due > elapsed && due - elapsed > kRefreshGuardUs;
-}
-
 void setup() {
-  // A whole run's DONE lines (~64 x 40 bytes) fit in the TX buffer, so printing never blocks mid-run.
+  // A whole run's DONE lines (~64 x 40 bytes) fit in the TX buffer, so serial printing never blocks.
   Serial.setTxBufferSize(4096);
   Serial.setRxBufferSize(1024);
   Serial.begin(kBaud);
   pad.begin();
   Serial.printf("BOOT %s %u\n", kFirmwareVersion, kProtocolVersion);
+  wifiBegin();
 }
 
 void loop() {
-  pollSerial();
+  pollLink(Serial, serialReader);
+
+  if (hasSlack()) {
+    bool fresh;
+    wifiService(&fresh);
+    if (fresh) tcpReader = {};
+  }
+  // Reads don't block, so unlike writes they run between closely spaced events: ABORT must work mid-run.
+  if (hasSlack(kReadGuardUs)) {
+    Stream *tcp = wifiClient();
+    if (tcp != nullptr) pollLink(*tcp, tcpReader);
+  }
 
   if (state == State::Armed && millis() - armedAtMs >= armTimeoutMs) {
+    cmdLink = runLink;
     replyErr("ARM_TIMEOUT", "-");
     abortTimeline();
   }
 
   if (state == State::Running) runDueEvents();
 
-  if (refreshAllowed()) pad.refresh();
+  if (state == State::Running && hasSlack()) reportResults(false);
+
+  // Re-check slack: reporting above may have used it up. None while armed, so the
+  // first event after FIRE never queues behind a keep-alive.
+  if (state != State::Armed && hasSlack() && millis() - lastKeepAliveMs >= kKeepAliveMs) {
+    lastKeepAliveMs = millis();
+    pad.refresh();
+  }
 }

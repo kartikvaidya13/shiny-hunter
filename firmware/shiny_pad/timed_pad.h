@@ -33,7 +33,7 @@ class TimedPad {
   SendStamp sendState(uint16_t buttons, uint8_t dpad,
                       uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
   SendStamp sendNeutral();
-  // 1 kHz keep-alive resend. Also blocks, so don't call it near a scheduled send.
+  // Keep-alive: resends the current report. Also blocks, so don't call it near a scheduled send.
   void refresh();
 };
 
