@@ -18,6 +18,8 @@ const uint32_t kMinSpacingUs = 10000;
 const uint32_t kKeepAliveMs = 100;
 // Keep-alives, network I/O and DONE output only run when the next event is further off than this.
 const uint32_t kSlackGuardUs = 20000;
+// TCP reads skip this window before an event: each poll costs tens of µs of event latency.
+const uint32_t kReadGuardUs = 2000;
 const size_t kLineMax = 128;
 const size_t kMaxTokens = 10;
 const uint8_t kStickCentre = 0x80;
@@ -98,12 +100,12 @@ bool parseU32(const char *s, int base, uint32_t max, uint32_t *out) {
   return true;
 }
 
-// True when nothing is due within kSlackGuardUs, so a blocking call can't delay an event.
-bool hasSlack() {
+// True when nothing is due within guardUs, so a slow call can't delay an event.
+bool hasSlack(uint32_t guardUs = kSlackGuardUs) {
   if (state != State::Running) return true;
   uint32_t elapsed = micros() - anchorUs;
   uint32_t due = events[nextEvent].at_us;
-  return due > elapsed && due - elapsed > kSlackGuardUs;
+  return due > elapsed && due - elapsed > guardUs;
 }
 
 // ANCHOR and DONE lines are held until there's slack: a TCP write can block for a millisecond.
@@ -300,8 +302,12 @@ void loop() {
 
   if (hasSlack()) {
     bool fresh;
-    Stream *tcp = wifiPoll(&fresh);
+    wifiService(&fresh);
     if (fresh) tcpReader = {};
+  }
+  // Reads don't block, so unlike writes they run between closely spaced events: ABORT must work mid-run.
+  if (hasSlack(kReadGuardUs)) {
+    Stream *tcp = wifiClient();
     if (tcp != nullptr) pollLink(*tcp, tcpReader);
   }
 
@@ -313,12 +319,12 @@ void loop() {
 
   if (state == State::Running) runDueEvents();
 
-  if (hasSlack()) {
-    if (state == State::Running) reportResults(false);
-    // None while armed: the first event after FIRE must not queue behind a keep-alive.
-    if (state != State::Armed && millis() - lastKeepAliveMs >= kKeepAliveMs) {
-      lastKeepAliveMs = millis();
-      pad.refresh();
-    }
+  if (state == State::Running && hasSlack()) reportResults(false);
+
+  // Re-check slack: reporting above may have used it up. None while armed, so the
+  // first event after FIRE never queues behind a keep-alive.
+  if (state != State::Armed && hasSlack() && millis() - lastKeepAliveMs >= kKeepAliveMs) {
+    lastKeepAliveMs = millis();
+    pad.refresh();
   }
 }

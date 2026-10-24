@@ -68,7 +68,8 @@ board replies `WIFI SAVED -`, then `WIFI UP <ip>` once connected, and reconnects
 on every boot. `WIFI` on its own shows the current state.
 
 The board then listens on **TCP port 4747** at **`shiny-pad.local`** (or its IP),
-one client at a time, using the same protocol as serial.
+one client at a time, using the same protocol as serial. A new connection replaces the
+old one, so a host that dropped off without closing never locks you out.
 
 ## Serial protocol
 
@@ -151,7 +152,6 @@ is nothing to add.
 | `QUEUE_FULL` | seq | 64 events already loaded |
 | `EMPTY` | `-` | `ARM` with no events |
 | `BUSY` | state | `EV`, `ARM` or `WIFI` while ARMED or RUNNING |
-| `BUSY` | `tcp` | a second TCP client tried to connect; it is disconnected |
 | `NOT_ALLOWED` | `tcp` | `WIFI` sent over TCP |
 | `MDNS` | `-` | `shiny-pad.local` could not be registered; use the IP |
 | `NOT_ARMED` | state | `FIRE` outside ARMED |

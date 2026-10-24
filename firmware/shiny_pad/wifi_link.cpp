@@ -60,39 +60,33 @@ void wifiPrintStatus(Print &out) {
   out.printf("WIFI %s %s\n", statusName(WiFi.status()), WiFi.localIP().toString().c_str());
 }
 
-Stream *wifiPoll(bool *fresh) {
+void wifiService(bool *fresh) {
   *fresh = false;
+  if (millis() - lastPollMs < kPollIntervalMs) return;
+  lastPollMs = millis();
 
-  if (millis() - lastPollMs >= kPollIntervalMs) {
-    lastPollMs = millis();
-
-    wl_status_t s = WiFi.status();
-    if (!statusKnown || s != lastStatus) {
-      statusKnown = true;
-      lastStatus = s;
-      wifiPrintStatus(Serial);
-      if (s == WL_CONNECTED && !serverStarted) {
-        if (!MDNS.begin(kHostname)) Serial.print("ERR MDNS -\n");
-        server.begin();
-        server.setNoDelay(true);
-        serverStarted = true;
-      }
-    }
-
-    if (serverStarted) {
-      WiFiClient incoming = server.accept();
-      if (incoming) {
-        if (client.connected()) {
-          incoming.print("ERR BUSY tcp\n");
-          incoming.stop();
-        } else {
-          client = incoming;
-          client.setNoDelay(true);
-          *fresh = true;
-        }
-      }
+  wl_status_t s = WiFi.status();
+  if (!statusKnown || s != lastStatus) {
+    statusKnown = true;
+    lastStatus = s;
+    wifiPrintStatus(Serial);
+    if (s == WL_CONNECTED && !serverStarted) {
+      if (!MDNS.begin(kHostname)) Serial.print("ERR MDNS -\n");
+      server.begin();
+      server.setNoDelay(true);
+      serverStarted = true;
     }
   }
 
+  if (!serverStarted) return;
+  WiFiClient incoming = server.accept();
+  if (!incoming) return;
+  if (client.connected()) client.stop();
+  client = incoming;
+  client.setNoDelay(true);
+  *fresh = true;
+}
+
+Stream *wifiClient() {
   return client.connected() ? &client : nullptr;
 }
