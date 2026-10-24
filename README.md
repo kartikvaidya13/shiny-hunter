@@ -13,8 +13,9 @@ lands on a chosen RNG state instead of being soft-reset at random.
 
 An ESP32-S3 devkit with two USB ports:
 
-- **Native USB** port → console dock. This is the gamepad.
-- **UART** port → PC. Used for upload and for the [serial protocol](#serial-protocol).
+- **Native USB** port (labelled USB) → console dock. This is the gamepad, and it powers the board.
+- **UART** port (labelled COM) → PC. Used for upload, Wi-Fi setup and debugging.
+  At runtime the PC talks to the board over Wi-Fi instead (see [Wi-Fi](#wi-fi)).
 - Optional: a logic analyser on **GPIO4**. It goes high for each timed send.
 
 ### Build
@@ -44,7 +45,7 @@ Communication** → On.
 ### Smoke test
 
 Open Serial Monitor at **115200** with line ending **Newline**. Type `PING`.
-You should get `PONG 0.1.0 1 64`. To press A for 100 ms:
+You should get `PONG 0.2.0 2 64`. To press A for 100 ms:
 
 ```
 EV 1 0 0004 15
@@ -53,12 +54,32 @@ ARM 30000
 FIRE
 ```
 
+### Wi-Fi
+
+On the local network only. Credentials are set once over serial and saved on
+the board; they never go in the repo. In Serial Monitor, type:
+
+```
+WIFI <ssid> <password>
+```
+
+(Neither may contain spaces. Leave out the password for an open network.) The
+board replies `WIFI SAVED -`, then `WIFI UP <ip>` once connected, and reconnects
+on every boot. `WIFI` on its own shows the current state.
+
+The board then listens on **TCP port 4747** at **`shiny-pad.local`** (or its IP),
+one client at a time, using the same protocol as serial.
+
 ## Serial protocol
 
-Protocol version **1**. UART at 115200 8N1. ASCII, one message per line,
-ending in `\n` (`\r\n` also works). Fields are separated by spaces. Commands
-are case-insensitive. Lines are at most 96 characters. Opening the port can
-reset the board, so ignore anything before `BOOT`.
+Protocol version **2**. The same commands work over UART (115200 8N1) and over
+TCP (port 4747). ASCII, one message per line, ending in `\n` (`\r\n` also
+works). Fields are separated by spaces. Commands are case-insensitive. Lines are
+at most 128 characters. Opening the serial port can reset the board, so ignore
+anything before `BOOT`.
+
+Replies go to the link the command came from. `ANCHOR`, `DONE`, `END` and the ARM timeout
+go to the link that sent `ARM`.
 
 The host uploads a timeline of events, arms it, then fires it. Each event is a
 full pad state, sent at `at_us` microseconds after `FIRE` arrives. Times are
@@ -77,11 +98,12 @@ ABORT (or an ARM timeout) returns to IDLE from any state
 | `ARM <timeout_ms>` | LOADING | `ARMED <events>` |
 | `FIRE` | ARMED | `ANCHOR <device_us>`, then one `DONE` per event, then `END` |
 | `ABORT` | any | `ABORTED` (queue cleared, neutral report sent) |
+| `WIFI [<ssid> [<password>]]` | IDLE, LOADING; **serial only** | `WIFI SAVED -`, or with no arguments `WIFI <state> <ip>` |
 
 `EV` fields:
 
 - `seq`: decimal 0–65535, must increase from one event to the next.
-- `at_us`: must increase, at least 2000 µs after the previous event. The 2000 is provisional until the timing bench test (F3) measures how long a send blocks.
+- `at_us`: must increase, at least 10 000 µs (10 ms) after the previous event. Measured on the Switch 2: it accepts one report per ~8 ms, and faster streams back up and drift off schedule.
 - `buttons_hex`: hex bitmask, max `3FFF`.
 - `dpad`: 0–7, or 15 for centred.
 - Sticks: decimal 0–255, all four or none. Default is 128 (centred).
@@ -109,6 +131,11 @@ Messages the device sends on its own:
 | `DONE <seq> <before_us> <error_us> <send_us>` | Event sent. `before_us` is device `micros()` just before the write. `error_us = before_us − (anchor + at_us)`. `send_us` is how long the write blocked |
 | `END <events> <max_abs_err_us> <failed_sends>` | Timeline finished, neutral report sent, anything still held released |
 | `ERR SEND <seq>` | The USB write failed (for example, nothing has enumerated the pad). `DONE` is still sent |
+| `WIFI <state> <ip>` | Serial only, on every Wi-Fi state change. State is `UP`, `CONNECTING`, `DOWN`, `LOST`, `NO_SSID`, `FAILED` or `OFF` |
+
+During a run, `ANCHOR` and `DONE` lines are held back until the next event is more than
+20 ms away (or until `END`), so a slow network write can never delay a press.
+The console sees a press when its write completes, at `before_us + send_us`.
 
 Device times are 32-bit `micros()`, which wraps about every 71.6 minutes.
 
@@ -123,7 +150,10 @@ is nothing to add.
 | `SEQ_ORDER` / `TIME_ORDER` / `SPACING` | seq | ordering or spacing rule broken |
 | `QUEUE_FULL` | seq | 64 events already loaded |
 | `EMPTY` | `-` | `ARM` with no events |
-| `BUSY` | state | `EV` or `ARM` while ARMED or RUNNING |
+| `BUSY` | state | `EV`, `ARM` or `WIFI` while ARMED or RUNNING |
+| `BUSY` | `tcp` | a second TCP client tried to connect; it is disconnected |
+| `NOT_ALLOWED` | `tcp` | `WIFI` sent over TCP |
+| `MDNS` | `-` | `shiny-pad.local` could not be registered; use the IP |
 | `NOT_ARMED` | state | `FIRE` outside ARMED |
 | `LINE_TOO_LONG` | `-` | line discarded |
 
