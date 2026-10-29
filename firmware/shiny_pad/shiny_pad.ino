@@ -8,8 +8,8 @@
 #include "timed_pad.h"
 #include "wifi_link.h"
 
-const char kFirmwareVersion[] = "0.2.0";
-const unsigned kProtocolVersion = 2;
+const char kFirmwareVersion[] = "0.3.0";
+const unsigned kProtocolVersion = 3;
 const uint32_t kBaud = 115200;
 const size_t kMaxEvents = 64;
 // F3, 2026-10-24, Switch 2: it accepts one report per ~8 ms; faster streams back up and drift.
@@ -142,6 +142,34 @@ void cmdPing() {
   cmdLink->printf("PONG %s %u %u\n", kFirmwareVersion, kProtocolVersion, (unsigned)freeSlots());
 }
 
+// Parses "<buttons_hex> <dpad> [lx ly rx ry]" from tok[first]; replies with the error on failure.
+bool parsePadFields(char **tok, size_t n, size_t first, uint32_t *buttons, uint32_t *dpad, uint32_t sticks[4]) {
+  static const char *const kStickNames[4] = {"lx", "ly", "rx", "ry"};
+  for (size_t i = 0; i < 4; i++) sticks[i] = kStickCentre;
+  if (!parseU32(tok[first], 16, kButtonMask, buttons)) { replyErr("BAD_VALUE", "buttons"); return false; }
+  if (!parseU32(tok[first + 1], 10, kDpadCentred, dpad) || (*dpad > 7 && *dpad != kDpadCentred)) {
+    replyErr("BAD_VALUE", "dpad");
+    return false;
+  }
+  if (n == first + 6) {
+    for (size_t i = 0; i < 4; i++) {
+      if (!parseU32(tok[first + 2 + i], 10, 255, &sticks[i])) { replyErr("BAD_VALUE", kStickNames[i]); return false; }
+    }
+  }
+  return true;
+}
+
+// Live pass-through: send a state now. Not while a timeline is armed or running.
+void cmdSet(char **tok, size_t n) {
+  if (state == State::Armed || state == State::Running) { replyErr("BUSY", stateName()); return; }
+  if (n != 3 && n != 7) { replyErr("BAD_ARGS", "SET"); return; }
+  uint32_t buttons, dpad, sticks[4];
+  if (!parsePadFields(tok, n, 1, &buttons, &dpad, sticks)) return;
+  SendStamp st = pad.sendState(buttons, dpad, sticks[0], sticks[1], sticks[2], sticks[3]);
+  cmdLink->printf("SENT %lu %lu\n", (unsigned long)st.before_us, (unsigned long)(st.after_us - st.before_us));
+  if (!st.ok) replyErr("SEND", "-");
+}
+
 void cmdEv(char **tok, size_t n) {
   if (state == State::Armed || state == State::Running) {
     replyErr("BUSY", stateName());
@@ -152,22 +180,10 @@ void cmdEv(char **tok, size_t n) {
     return;
   }
 
-  uint32_t seq, at, buttons, dpad;
-  uint32_t sticks[4] = {kStickCentre, kStickCentre, kStickCentre, kStickCentre};
-  static const char *const kStickNames[4] = {"lx", "ly", "rx", "ry"};
-
+  uint32_t seq, at, buttons, dpad, sticks[4];
   if (!parseU32(tok[1], 10, 0xFFFF, &seq)) { replyErr("BAD_VALUE", "seq"); return; }
   if (!parseU32(tok[2], 10, UINT32_MAX, &at)) { replyErr("BAD_VALUE", "at_us"); return; }
-  if (!parseU32(tok[3], 16, kButtonMask, &buttons)) { replyErr("BAD_VALUE", "buttons"); return; }
-  if (!parseU32(tok[4], 10, kDpadCentred, &dpad) || (dpad > 7 && dpad != kDpadCentred)) {
-    replyErr("BAD_VALUE", "dpad");
-    return;
-  }
-  if (n == 9) {
-    for (size_t i = 0; i < 4; i++) {
-      if (!parseU32(tok[5 + i], 10, 255, &sticks[i])) { replyErr("BAD_VALUE", kStickNames[i]); return; }
-    }
-  }
+  if (!parsePadFields(tok, n, 3, &buttons, &dpad, sticks)) return;
 
   if (eventCount == kMaxEvents) { replyErrSeq("QUEUE_FULL", seq); return; }
   if (eventCount > 0) {
@@ -234,6 +250,7 @@ void handleLine(char *s) {
   const char *cmd = tok[0];
   bool bare = (n == 1);
   if (strcasecmp(cmd, "EV") == 0) cmdEv(tok, n);
+  else if (strcasecmp(cmd, "SET") == 0) cmdSet(tok, n);
   else if (strcasecmp(cmd, "ARM") == 0) cmdArm(tok, n);
   else if (strcasecmp(cmd, "WIFI") == 0) cmdWifi(tok, n);
   else if (strcasecmp(cmd, "PING") == 0) bare ? cmdPing() : replyErr("BAD_ARGS", "PING");
