@@ -45,7 +45,7 @@ Communication** → On.
 ### Smoke test
 
 Open Serial Monitor at **115200** with line ending **Newline**. Type `PING`.
-You should get `PONG 0.2.0 2 64`. To press A for 100 ms:
+You should get `PONG 0.3.0 3 64`. To press A for 100 ms:
 
 ```
 EV 1 0 0004 15
@@ -73,7 +73,7 @@ old one, so a host that dropped off without closing never locks you out.
 
 ## Serial protocol
 
-Protocol version **2**. The same commands work over UART (115200 8N1) and over
+Protocol version **3**. The same commands work over UART (115200 8N1) and over
 TCP (port 4747). ASCII, one message per line, ending in `\n` (`\r\n` also
 works). Fields are separated by spaces. Commands are case-insensitive. Lines are
 at most 128 characters. Opening the serial port can reset the board, so ignore
@@ -99,6 +99,7 @@ ABORT (or an ARM timeout) returns to IDLE from any state
 | `ARM <timeout_ms>` | LOADING | `ARMED <events>` |
 | `FIRE` | ARMED | `ANCHOR <device_us>`, then one `DONE` per event, then `END` |
 | `ABORT` | any | `ABORTED` (queue cleared, neutral report sent) |
+| `SET <buttons_hex> <dpad> [lx ly rx ry]` | IDLE, LOADING | Sends that state **immediately**: `SENT <before_us> <send_us>`. For live pass-through; same fields as `EV` |
 | `WIFI [<ssid> [<password>]]` | IDLE, LOADING; **serial only** | `WIFI SAVED -`, or with no arguments `WIFI <state> <ip>` |
 
 `EV` fields:
@@ -151,7 +152,7 @@ is nothing to add.
 | `SEQ_ORDER` / `TIME_ORDER` / `SPACING` | seq | ordering or spacing rule broken |
 | `QUEUE_FULL` | seq | 64 events already loaded |
 | `EMPTY` | `-` | `ARM` with no events |
-| `BUSY` | state | `EV`, `ARM` or `WIFI` while ARMED or RUNNING |
+| `BUSY` | state | `EV`, `ARM`, `SET` or `WIFI` while ARMED or RUNNING |
 | `NOT_ALLOWED` | `tcp` | `WIFI` sent over TCP |
 | `MDNS` | `-` | `shiny-pad.local` could not be registered; use the IP |
 | `NOT_ARMED` | state | `FIRE` outside ARMED |
